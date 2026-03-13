@@ -80,9 +80,11 @@ def read_incucyte_csv(path_or_buffer) -> pd.DataFrame:
     required = {"time", "group", "value"}
     if required.issubset(cols_lower):
         # normalise names
-        df = df.rename(columns={lower_map["time"]: "time",
-                                lower_map["group"]: "group",
-                                lower_map["value"]: "value"})
+        df = df.rename(columns={
+            lower_map["time"]: "time",
+            lower_map["group"]: "group",
+            lower_map["value"]: "value",
+        })
         if "replicate" in cols_lower:
             df = df.rename(columns={lower_map["replicate"]: "replicate"})
         else:
@@ -124,6 +126,32 @@ def aggregate_mean_sd(df: pd.DataFrame, interval_hours: float = None) -> pd.Data
     )
     group_stats = group_stats.rename(columns={time_col: "time"})
     return group_stats
+
+
+def make_color_list(n: int):
+    """
+    Return at least n colors.
+    Uses matplotlib categorical palettes and expands beyond 10 groups safely.
+    """
+    cmap_names = ["tab20", "tab20b", "tab20c"]
+    colors = []
+
+    for cmap_name in cmap_names:
+        cmap = plt.get_cmap(cmap_name)
+        for i in range(cmap.N):
+            c = cmap(i)
+            hex_color = "#{0:02x}{1:02x}{2:02x}".format(
+                int(c[0] * 255),
+                int(c[1] * 255),
+                int(c[2] * 255),
+            )
+            colors.append(hex_color)
+
+    if n <= len(colors):
+        return colors[:n]
+
+    repeats = (n + len(colors) - 1) // len(colors)
+    return (colors * repeats)[:n]
 
 
 # ---------- Streamlit UI ----------
@@ -172,7 +200,6 @@ else:
         "Add/remove rows as needed."
     )
 
-    # starter template (you can change these defaults)
     starter = pd.DataFrame(
         {
             "time": [0.0, 0.0, 2.0, 2.0],
@@ -189,7 +216,6 @@ else:
         key="manual_editor",
     )
 
-    # clean up
     edited["time"] = pd.to_numeric(edited["time"], errors="coerce")
     edited["value"] = pd.to_numeric(edited["value"], errors="coerce")
     edited["group"] = edited["group"].astype(str)
@@ -207,16 +233,14 @@ if tidy is not None and not tidy.empty:
     st.dataframe(tidy.head())
 
     # Unique groups
-    groups = list(pd.unique(tidy["group"].astype(str)))
+    groups = sorted(pd.unique(tidy["group"].astype(str)).tolist())
 
     # ---------- Sidebar settings ----------
     st.sidebar.header("Plot settings")
 
-    # Axis labels
     x_label = st.sidebar.text_input("X axis label", value="Time (h)")
     y_label = st.sidebar.text_input("Y axis label", value="Confluence / Intensity")
 
-    # Optional time binning (true averaging) – e.g. from 2-hour -> 6-hour bins
     interval = st.sidebar.number_input(
         "Time binning (hours, 0 = no binning)",
         min_value=0.0,
@@ -225,10 +249,8 @@ if tidy is not None and not tidy.empty:
     )
     interval_hours = interval if interval > 0 else None
 
-    # Error bars
     error_choice = st.sidebar.selectbox("Error bars", ["SD", "None"], index=0)
 
-    # Visual smoothing: plot every Nth point
     smooth_step = st.sidebar.number_input(
         "Plot every Nth timepoint (visual smoothing)",
         min_value=1,
@@ -239,24 +261,14 @@ if tidy is not None and not tidy.empty:
 
     # Editable group table for names & colours
     st.sidebar.markdown("### Groups")
-    default_colors = [
-        "#1f77b4",
-        "#ff7f0e",
-        "#2ca02c",
-        "#d62728",
-        "#9467bd",
-        "#8c564b",
-        "#e377c2",
-        "#7f7f7f",
-        "#bcbd22",
-        "#17becf",
-    ]
+
+    color_list = make_color_list(len(groups))
 
     group_df = pd.DataFrame(
         {
             "group": groups,
             "display_name": groups,
-            "color": default_colors[: len(groups)],
+            "color": color_list,
         }
     )
 
@@ -281,18 +293,23 @@ if tidy is not None and not tidy.empty:
     # ---------- Plot: mean ± SD ----------
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    for g, sub in stats.groupby("group"):
+    for g, sub in stats.groupby("group", sort=False):
         sub = sub.sort_values("time")
         name = sub["display_name"].iloc[0]
-        color = sub["color"].iloc[0] or None
+        color = sub["color"].iloc[0] if pd.notna(sub["color"].iloc[0]) else None
 
-        # visual down-sampling for plotting only
         if smooth_step > 1:
             sub_plot = sub.iloc[::smooth_step].copy()
         else:
             sub_plot = sub
 
-        ax.plot(sub_plot["time"], sub_plot["mean"], label=name, color=color, linewidth=2)
+        ax.plot(
+            sub_plot["time"],
+            sub_plot["mean"],
+            label=name,
+            color=color,
+            linewidth=2,
+        )
 
         if error_choice == "SD" and sub_plot["sd"].notna().any():
             ax.fill_between(
@@ -311,7 +328,6 @@ if tidy is not None and not tidy.empty:
     st.subheader("Mean ± SD per group")
     st.pyplot(fig)
 
-    # Download button for mean plot (high-res PNG)
     buf_mean = io.BytesIO()
     fig.savefig(buf_mean, format="png", dpi=300, bbox_inches="tight")
     buf_mean.seek(0)
@@ -325,32 +341,36 @@ if tidy is not None and not tidy.empty:
     # ---------- Plot: replicate spaghetti ----------
     fig2, ax2 = plt.subplots(figsize=(8, 5))
 
-    for (g, r), sub in tidy_merged.groupby(["group", "replicate"]):
+    for (g, r), sub in tidy_merged.groupby(["group", "replicate"], sort=False):
         sub = sub.sort_values("time")
         name = sub["display_name"].iloc[0]
-        color = sub["color"].iloc[0] or None
+        color = sub["color"].iloc[0] if pd.notna(sub["color"].iloc[0]) else None
         ax2.plot(sub["time"], sub["value"], color=color, alpha=0.4, label=name)
 
-    # deduplicate legend labels (one per group)
+    # deduplicate legend labels
     handles, labels = ax2.get_legend_handles_labels()
-    seen = {}
+    seen = set()
     new_handles, new_labels = [], []
     for h, l in zip(handles, labels):
         if l not in seen:
             new_handles.append(h)
             new_labels.append(l)
-            seen[l] = True
+            seen.add(l)
 
     ax2.set_xlabel(x_label)
     ax2.set_ylabel(y_label)
-    ax2.legend(new_handles, new_labels, title="Group",
-               bbox_to_anchor=(1.05, 1), loc="upper left")
+    ax2.legend(
+        new_handles,
+        new_labels,
+        title="Group",
+        bbox_to_anchor=(1.05, 1),
+        loc="upper left",
+    )
     ax2.grid(True, alpha=0.3)
 
     st.subheader("Replicate spaghetti plot")
     st.pyplot(fig2)
 
-    # Download button for spaghetti plot
     buf_spag = io.BytesIO()
     fig2.savefig(buf_spag, format="png", dpi=300, bbox_inches="tight")
     buf_spag.seek(0)
