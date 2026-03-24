@@ -106,9 +106,9 @@ def read_incucyte_csv(path_or_buffer) -> pd.DataFrame:
     )
 
 
-def aggregate_mean_sd(df: pd.DataFrame, interval_hours: float = None) -> pd.DataFrame:
+def aggregate_stats(df: pd.DataFrame, interval_hours: float = None) -> pd.DataFrame:
     """
-    Aggregate replicates to group-level mean ± SD.
+    Aggregate replicates to group-level mean ± SD/SEM.
     If interval_hours is not None, bin time into that spacing (e.g., 4 h).
     """
     d = df.copy()
@@ -125,6 +125,8 @@ def aggregate_mean_sd(df: pd.DataFrame, interval_hours: float = None) -> pd.Data
         .agg(mean="mean", sd="std", n="count")
     )
     group_stats = group_stats.rename(columns={time_col: "time"})
+    group_stats["sd"] = group_stats["sd"].fillna(0.0)
+    group_stats["sem"] = group_stats["sd"] / np.sqrt(group_stats["n"].clip(lower=1))
     return group_stats
 
 
@@ -152,6 +154,33 @@ def make_color_list(n: int):
 
     repeats = (n + len(colors) - 1) // len(colors)
     return (colors * repeats)[:n]
+
+
+def save_figure_bytes(fig, fmt="png", dpi=300):
+    """Save matplotlib figure to bytes for download."""
+    buf = io.BytesIO()
+    save_kwargs = {"format": fmt, "bbox_inches": "tight"}
+
+    if fmt.lower() in {"png", "jpg", "jpeg", "tif", "tiff"}:
+        save_kwargs["dpi"] = dpi
+
+    fig.savefig(buf, **save_kwargs)
+    buf.seek(0)
+    return buf
+
+
+def get_download_mime(fmt: str) -> str:
+    fmt = fmt.lower()
+    mime_map = {
+        "png": "image/png",
+        "pdf": "application/pdf",
+        "svg": "image/svg+xml",
+        "tif": "image/tiff",
+        "tiff": "image/tiff",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+    }
+    return mime_map.get(fmt, "application/octet-stream")
 
 
 # ---------- Streamlit UI ----------
@@ -232,8 +261,8 @@ if tidy is not None and not tidy.empty:
     st.subheader("Parsed data (tidy format)")
     st.dataframe(tidy.head())
 
-    # Unique groups
-    groups = sorted(pd.unique(tidy["group"].astype(str)).tolist())
+    groups = pd.unique(tidy["group"].astype(str)).tolist()
+    default_colors = make_color_list(len(groups))
 
     # ---------- Sidebar settings ----------
     st.sidebar.header("Plot settings")
@@ -249,7 +278,11 @@ if tidy is not None and not tidy.empty:
     )
     interval_hours = interval if interval > 0 else None
 
-    error_choice = st.sidebar.selectbox("Error bars", ["SD", "None"], index=0)
+    error_choice = st.sidebar.selectbox(
+        "Error band",
+        ["SEM", "SD", "None"],
+        index=0,
+    )
 
     smooth_step = st.sidebar.number_input(
         "Plot every Nth timepoint (visual smoothing)",
@@ -259,39 +292,142 @@ if tidy is not None and not tidy.empty:
         help="1 = use all points; 2 = every 2nd; 3 = every 3rd; etc.",
     )
 
-    # Editable group table for names & colours
-    st.sidebar.markdown("### Groups")
+    show_replicates_on_mean = st.sidebar.checkbox(
+        "Overlay faint replicate lines on mean plot",
+        value=False,
+    )
 
-    color_list = make_color_list(len(groups))
+    replicate_alpha = st.sidebar.slider(
+        "Replicate line opacity",
+        min_value=0.05,
+        max_value=1.0,
+        value=0.25,
+        step=0.05,
+    )
+
+    band_alpha = st.sidebar.slider(
+        "Error band opacity",
+        min_value=0.05,
+        max_value=0.8,
+        value=0.20,
+        step=0.05,
+    )
+
+    line_width = st.sidebar.slider(
+        "Mean line width",
+        min_value=1.0,
+        max_value=5.0,
+        value=2.5,
+        step=0.5,
+    )
+
+    st.sidebar.markdown("### Figure size")
+    figure_preset = st.sidebar.selectbox(
+        "Export preset",
+        ["Custom", "Screen", "Presentation", "Publication single-column", "Publication double-column"],
+        index=3,
+    )
+
+    preset_dims = {
+        "Custom": (8.0, 5.0),
+        "Screen": (8.0, 5.0),
+        "Presentation": (10.0, 6.0),
+        "Publication single-column": (3.35, 2.6),
+        "Publication double-column": (6.9, 4.8),
+    }
+
+    default_w, default_h = preset_dims[figure_preset]
+
+    fig_width = st.sidebar.number_input(
+        "Figure width (inches)",
+        min_value=2.0,
+        max_value=20.0,
+        value=float(default_w),
+        step=0.1,
+    )
+    fig_height = st.sidebar.number_input(
+        "Figure height (inches)",
+        min_value=2.0,
+        max_value=20.0,
+        value=float(default_h),
+        step=0.1,
+    )
+
+    st.sidebar.markdown("### Publication export")
+    export_format = st.sidebar.selectbox(
+        "Download format",
+        ["PNG", "PDF", "SVG", "TIFF"],
+        index=0,
+    )
+    export_dpi = st.sidebar.selectbox(
+        "Raster DPI",
+        [150, 300, 600, 1200],
+        index=2,
+        help="Used for PNG/TIFF only. PDF/SVG are vector exports.",
+    )
+
+    st.sidebar.markdown("### Groups")
+    st.sidebar.caption("Rename groups and set colours manually.")
+
+    name_map = {}
+    color_map = {}
+    for i, g in enumerate(groups):
+        with st.sidebar.expander(f"{g}", expanded=False):
+            display_name = st.text_input(
+                f"Display name for {g}",
+                value=g,
+                key=f"display_name_{i}",
+            )
+            chosen_color = st.color_picker(
+                f"Colour for {g}",
+                value=default_colors[i],
+                key=f"color_{i}",
+            )
+        name_map[g] = display_name
+        color_map[g] = chosen_color
 
     group_df = pd.DataFrame(
         {
             "group": groups,
-            "display_name": groups,
-            "color": color_list,
+            "display_name": [name_map[g] for g in groups],
+            "color": [color_map[g] for g in groups],
         }
     )
 
-    edited_group_df = st.sidebar.data_editor(
-        group_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        key="group_editor",
-    )
-
     # ---------- Compute stats ----------
-    stats = aggregate_mean_sd(tidy, interval_hours=interval_hours)
+    stats = aggregate_stats(tidy, interval_hours=interval_hours)
 
-    # Merge display names & colours
     stats = stats.merge(
-        edited_group_df, on="group", how="left", validate="many_to_one"
+        group_df, on="group", how="left", validate="many_to_one"
     )
     tidy_merged = tidy.merge(
-        edited_group_df, on="group", how="left", validate="many_to_one"
+        group_df, on="group", how="left", validate="many_to_one"
     )
 
-    # ---------- Plot: mean ± SD ----------
-    fig, ax = plt.subplots(figsize=(8, 5))
+    error_col = None
+    plot_title_suffix = ""
+    if error_choice == "SD":
+        error_col = "sd"
+        plot_title_suffix = " ± SD"
+    elif error_choice == "SEM":
+        error_col = "sem"
+        plot_title_suffix = " ± SEM"
+
+    # ---------- Plot: mean ± chosen error ----------
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    if show_replicates_on_mean:
+        for (g, r), sub in tidy_merged.groupby(["group", "replicate"], sort=False):
+            sub = sub.sort_values("time")
+            color = sub["color"].iloc[0] if pd.notna(sub["color"].iloc[0]) else None
+            ax.plot(
+                sub["time"],
+                sub["value"],
+                color=color,
+                alpha=replicate_alpha,
+                linewidth=1.0,
+                zorder=1,
+            )
 
     for g, sub in stats.groupby("group", sort=False):
         sub = sub.sort_values("time")
@@ -308,16 +444,18 @@ if tidy is not None and not tidy.empty:
             sub_plot["mean"],
             label=name,
             color=color,
-            linewidth=2,
+            linewidth=line_width,
+            zorder=3,
         )
 
-        if error_choice == "SD" and sub_plot["sd"].notna().any():
+        if error_col is not None and sub_plot[error_col].notna().any():
             ax.fill_between(
                 sub_plot["time"],
-                sub_plot["mean"] - sub_plot["sd"],
-                sub_plot["mean"] + sub_plot["sd"],
-                alpha=0.2,
+                sub_plot["mean"] - sub_plot[error_col],
+                sub_plot["mean"] + sub_plot[error_col],
+                alpha=band_alpha,
                 color=color,
+                zorder=2,
             )
 
     ax.set_xlabel(x_label)
@@ -325,27 +463,64 @@ if tidy is not None and not tidy.empty:
     ax.legend(title="Group", bbox_to_anchor=(1.05, 1), loc="upper left")
     ax.grid(True, alpha=0.3)
 
-    st.subheader("Mean ± SD per group")
+    st.subheader(f"Mean{plot_title_suffix} per group")
     st.pyplot(fig)
 
-    buf_mean = io.BytesIO()
-    fig.savefig(buf_mean, format="png", dpi=300, bbox_inches="tight")
-    buf_mean.seek(0)
+    fmt = export_format.lower()
+    if fmt == "tiff":
+        fmt = "tif"
+
+    mean_buf = save_figure_bytes(fig, fmt=fmt, dpi=export_dpi)
     st.download_button(
-        "Download mean plot (PNG, 300 dpi)",
-        data=buf_mean,
-        file_name="incucyte_mean_sd.png",
-        mime="image/png",
+        f"Download mean plot ({export_format}, {'vector' if export_format in ['PDF', 'SVG'] else f'{export_dpi} dpi'})",
+        data=mean_buf,
+        file_name=f"incucyte_mean_{error_choice.lower()}.{fmt}",
+        mime=get_download_mime(fmt),
     )
 
+    # Optional quick-access publication downloads
+    png300_buf = save_figure_bytes(fig, fmt="png", dpi=300)
+    png600_buf = save_figure_bytes(fig, fmt="png", dpi=600)
+    pdf_buf = save_figure_bytes(fig, fmt="pdf", dpi=export_dpi)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.download_button(
+            "Quick download PNG 300 dpi",
+            data=png300_buf,
+            file_name=f"incucyte_mean_{error_choice.lower()}_300dpi.png",
+            mime="image/png",
+        )
+    with col2:
+        st.download_button(
+            "Quick download PNG 600 dpi",
+            data=png600_buf,
+            file_name=f"incucyte_mean_{error_choice.lower()}_600dpi.png",
+            mime="image/png",
+        )
+    with col3:
+        st.download_button(
+            "Quick download PDF (vector)",
+            data=pdf_buf,
+            file_name=f"incucyte_mean_{error_choice.lower()}.pdf",
+            mime="application/pdf",
+        )
+
     # ---------- Plot: replicate spaghetti ----------
-    fig2, ax2 = plt.subplots(figsize=(8, 5))
+    fig2, ax2 = plt.subplots(figsize=(fig_width, fig_height))
 
     for (g, r), sub in tidy_merged.groupby(["group", "replicate"], sort=False):
         sub = sub.sort_values("time")
         name = sub["display_name"].iloc[0]
         color = sub["color"].iloc[0] if pd.notna(sub["color"].iloc[0]) else None
-        ax2.plot(sub["time"], sub["value"], color=color, alpha=0.4, label=name)
+        ax2.plot(
+            sub["time"],
+            sub["value"],
+            color=color,
+            alpha=replicate_alpha,
+            linewidth=1.5,
+            label=name,
+        )
 
     # deduplicate legend labels
     handles, labels = ax2.get_legend_handles_labels()
@@ -371,25 +546,27 @@ if tidy is not None and not tidy.empty:
     st.subheader("Replicate spaghetti plot")
     st.pyplot(fig2)
 
-    buf_spag = io.BytesIO()
-    fig2.savefig(buf_spag, format="png", dpi=300, bbox_inches="tight")
-    buf_spag.seek(0)
+    spag_buf = save_figure_bytes(fig2, fmt=fmt, dpi=export_dpi)
     st.download_button(
-        "Download spaghetti plot (PNG, 300 dpi)",
-        data=buf_spag,
-        file_name="incucyte_spaghetti.png",
-        mime="image/png",
+        f"Download spaghetti plot ({export_format}, {'vector' if export_format in ['PDF', 'SVG'] else f'{export_dpi} dpi'})",
+        data=spag_buf,
+        file_name=f"incucyte_spaghetti.{fmt}",
+        mime=get_download_mime(fmt),
     )
 
     # ---------- Summary table + CSV ----------
-    st.subheader("Summary (mean ± SD)")
-    st.dataframe(stats[["group", "display_name", "time", "mean", "sd", "n"]])
+    st.subheader("Summary table")
+    st.dataframe(
+        stats[["group", "display_name", "time", "mean", "sd", "sem", "n"]]
+        .sort_values(["group", "time"])
+        .reset_index(drop=True)
+    )
 
     csv_buffer = io.StringIO()
     stats.to_csv(csv_buffer, index=False)
     st.download_button(
         "Download summary CSV",
         data=csv_buffer.getvalue(),
-        file_name="incucyte_summary_mean_sd.csv",
+        file_name="incucyte_summary_mean_sd_sem.csv",
         mime="text/csv",
     )
