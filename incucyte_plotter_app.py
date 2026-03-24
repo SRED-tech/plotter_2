@@ -518,6 +518,7 @@ if tidy is not None and not tidy.empty:
     # ---------- Plot: mean ± chosen error ----------
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
+    # Plot replicate overlays first
     if show_replicates_on_mean:
         for (g, r), sub in tidy_merged.groupby(["group", "replicate"], sort=False):
             sub = sub.sort_values("time")
@@ -529,8 +530,13 @@ if tidy is not None and not tidy.empty:
                 alpha=replicate_alpha,
                 linewidth=1.0,
                 zorder=1,
+                solid_capstyle="round",
+                solid_joinstyle="round",
+                antialiased=True,
             )
 
+    # Build plotted subsets once so bands can go underneath all lines
+    plot_subs = []
     for g, sub in stats.groupby("group", sort=False):
         sub = sub.sort_values("time")
         name = sub["display_name"].iloc[0]
@@ -539,8 +545,26 @@ if tidy is not None and not tidy.empty:
         if smooth_step > 1:
             sub_plot = sub.iloc[::smooth_step].copy()
         else:
-            sub_plot = sub
+            sub_plot = sub.copy()
 
+        plot_subs.append((g, name, color, sub_plot))
+
+    # Draw all error bands first
+    if error_col is not None:
+        for g, name, color, sub_plot in plot_subs:
+            if sub_plot[error_col].notna().any():
+                ax.fill_between(
+                    sub_plot["time"],
+                    sub_plot["mean"] - sub_plot[error_col],
+                    sub_plot["mean"] + sub_plot[error_col],
+                    alpha=band_alpha,
+                    color=color,
+                    zorder=2,
+                    linewidth=0,
+                )
+
+    # Then draw all mean lines on top
+    for g, name, color, sub_plot in plot_subs:
         ax.plot(
             sub_plot["time"],
             sub_plot["mean"],
@@ -548,17 +572,10 @@ if tidy is not None and not tidy.empty:
             color=color,
             linewidth=line_width,
             zorder=3,
+            solid_capstyle="round",
+            solid_joinstyle="round",
+            antialiased=True,
         )
-
-        if error_col is not None and sub_plot[error_col].notna().any():
-            ax.fill_between(
-                sub_plot["time"],
-                sub_plot["mean"] - sub_plot[error_col],
-                sub_plot["mean"] + sub_plot[error_col],
-                alpha=band_alpha,
-                color=color,
-                zorder=2,
-            )
 
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
@@ -622,6 +639,9 @@ if tidy is not None and not tidy.empty:
             alpha=replicate_alpha,
             linewidth=1.5,
             label=name,
+            solid_capstyle="round",
+            solid_joinstyle="round",
+            antialiased=True,
         )
 
     # deduplicate legend labels
