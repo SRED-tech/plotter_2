@@ -5,7 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# ---------- Helpers to parse CSV (wide or tidy) ----------
+# ---------- Helpers to parse CSV / TSV / Incucyte export ----------
 
 def _coerce_time(col):
     """Coerce a 'time' column to float hours."""
@@ -13,7 +13,6 @@ def _coerce_time(col):
     if c.notna().all():
         return c.astype(float)
 
-    # If Incucyte-like strings, try to pull out numbers
     s = col.astype(str).str.extract(r"([0-9]*\.?[0-9]+)")[0]
     return pd.to_numeric(s, errors="coerce").astype(float)
 
@@ -24,16 +23,156 @@ def _base_group_name(colname: str) -> str:
     return m.group(1) if m else str(colname)
 
 
+def _clean_incucyte_group_name(colname: str) -> str:
+    """
+    Convert an Incucyte export column name like:
+    'e6y3_purifiedNS (1) 35K / well Unstimulated 100 mg/ml (D1)'
+    into a cleaner group name like:
+    'e6y3_purifiedNS - Unstimulated'
+    """
+    s = str(colname)
+
+    # Remove trailing well ID like (D1)
+    s = re.sub(r"\s*\([A-Z]\d+\)\s*$", "", s)
+
+    # Remove common density / well text
+    s = re.sub(r"\s*\(\d+\)\s*\d+\s*K\s*/\s*well\s*", " | ", s, flags=re.IGNORECASE)
+
+    # Remove dosage-like phrases
+    s = re.sub(r"\s+\d+\s*mg/ml", "", s, flags=re.IGNORECASE)
+
+    # Normalize separators
+    s = s.replace(" | ", " - ").strip()
+
+    return s
+
+
+def _extract_well_id(colname: str) -> str:
+    """Extract well ID from an Incucyte export column name, e.g. (D1) -> D1."""
+    m = re.search(r"\(([A-Z]\d+)\)\s*$", str(colname))
+    return m.group(1) if m else ""
+
+
+def _detect_incucyte_export(raw_text: str) -> bool:
+    """
+    Detect Incucyte text export by metadata + header pattern.
+    """
+    lines = raw_text.splitlines()
+    if len(lines) < 2:
+        return False
+
+    first = lines[0].strip()
+    second = lines[1].strip()
+
+    return (
+        first.startswith("Vessel Name:")
+        and "Date Time" in second
+        and "Elapsed" in second
+    )
+
+
+def _read_text_buffer(uploaded_file) -> str:
+    """Read uploaded file safely as text and restore pointer."""
+    raw = uploaded_file.getvalue()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin1")
+
+
+def parse_incucyte_export(path_or_buffer) -> pd.DataFrame:
+    """
+    Parse Incucyte text export like:
+    row 1: metadata (e.g. Vessel Name: ...)
+    row 2: tab-delimited header with Date Time, Elapsed, and well columns
+
+    Returns tidy dataframe with columns: time, group, replicate, value
+    """
+    if hasattr(path_or_buffer, "getvalue"):
+        text = _read_text_buffer(path_or_buffer)
+        data_io = io.StringIO(text)
+    else:
+        with open(path_or_buffer, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        data_io = io.StringIO(text)
+
+    df = pd.read_csv(data_io, sep="\t", skiprows=1)
+
+    if "Elapsed" not in df.columns:
+        raise ValueError("Incucyte export detected, but could not find 'Elapsed' column.")
+
+    # Keep only data columns
+    value_cols = [c for c in df.columns if c not in ["Date Time", "Elapsed"]]
+
+    long = df.melt(
+        id_vars=["Elapsed"],
+        value_vars=value_cols,
+        var_name="raw_col",
+        value_name="value",
+    )
+
+    long = long.rename(columns={"Elapsed": "time"})
+
+    # Group name: strip well suffix and simplify label
+    long["group"] = long["raw_col"].apply(_clean_incucyte_group_name)
+
+    # Replicate from within-group well order
+    # Example: D1,D2,D3 -> R1,R2,R3 ; D4,D5,D6 -> R1,R2,R3
+    long["well_id"] = long["raw_col"].apply(_extract_well_id)
+
+    # Compute replicate index within each group based on original column order
+    col_map = pd.DataFrame({"raw_col": value_cols})
+    col_map["group"] = col_map["raw_col"].apply(_clean_incucyte_group_name)
+    col_map["replicate_num"] = col_map.groupby("group").cumcount() + 1
+    col_map["replicate"] = "R" + col_map["replicate_num"].astype(str)
+
+    long = long.merge(
+        col_map[["raw_col", "replicate"]],
+        on="raw_col",
+        how="left",
+        validate="many_to_one",
+    )
+
+    long["time"] = _coerce_time(long["time"])
+    long["value"] = pd.to_numeric(long["value"], errors="coerce")
+    long["group"] = long["group"].astype(str)
+    long["replicate"] = long["replicate"].fillna("R1").astype(str)
+
+    # Preserve group order from the file header
+    group_order = pd.unique(col_map["group"]).tolist()
+    long["group"] = pd.Categorical(long["group"], categories=group_order, ordered=True)
+
+    long = long.dropna(subset=["time", "value"])
+
+    return long[["time", "group", "replicate", "value"]].reset_index(drop=True)
+
+
 def read_incucyte_csv(path_or_buffer) -> pd.DataFrame:
     """
-    Read either:
-      A) WIDE format: 'time' + one column per group (e.g., Time,A,B,C)
+    Read any of:
+      A) Standard wide CSV: 'time' + one column per group
          Optional replicates via suffixes: A_R1, A_R2, B_R1 ...
-      B) TIDY format: time, group, replicate, value
+      B) Standard tidy CSV: time, group, replicate, value
+      C) Incucyte text export: metadata row + tab-delimited well columns
 
-    Returns a tidy DataFrame with columns: time, group, replicate, value
+    Returns tidy DataFrame with columns: time, group, replicate, value
     """
-    df = pd.read_csv(path_or_buffer)
+    # --- First: check if this is an Incucyte text export ---
+    if hasattr(path_or_buffer, "getvalue"):
+        text = _read_text_buffer(path_or_buffer)
+        if _detect_incucyte_export(text):
+            return parse_incucyte_export(io.BytesIO(path_or_buffer.getvalue()))
+        file_bytes = path_or_buffer.getvalue()
+        csv_io = io.BytesIO(file_bytes)
+    else:
+        with open(path_or_buffer, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        if _detect_incucyte_export(text):
+            return parse_incucyte_export(path_or_buffer)
+        csv_io = path_or_buffer
+
+    # --- Otherwise: normal CSV/Tidy parsing ---
+    df = pd.read_csv(csv_io)
     lower_map = {c.lower(): c for c in df.columns}
     cols_lower = set(lower_map.keys())
 
@@ -50,14 +189,12 @@ def read_incucyte_csv(path_or_buffer) -> pd.DataFrame:
             value_name="value",
         )
 
-        # detect replicate suffixes
         m = long["col"].astype(str).str.extract(r"^(.*)_(R\d+|Rep\d+|rep\d+)$")
         has_rep = m.notna().all(axis=1)
 
         long["group"] = np.where(has_rep, m[0], long["col"].astype(str))
         long["replicate"] = np.where(has_rep, m[1], "R1")
 
-        # preserve base group order from header
         group_order = []
         seen = set()
         for c in value_cols_in_order:
@@ -79,7 +216,6 @@ def read_incucyte_csv(path_or_buffer) -> pd.DataFrame:
     # --------- TIDY format ---------
     required = {"time", "group", "value"}
     if required.issubset(cols_lower):
-        # normalise names
         df = df.rename(columns={
             lower_map["time"]: "time",
             lower_map["group"]: "group",
@@ -99,18 +235,14 @@ def read_incucyte_csv(path_or_buffer) -> pd.DataFrame:
         return df[["time", "group", "replicate", "value"]].reset_index(drop=True)
 
     raise ValueError(
-        "Could not detect wide or tidy format. "
-        "Need either:\n"
-        "  Wide: 'time' + one column per group\n"
-        "  Tidy: time, group, (replicate), value"
+        "Could not detect supported format. Need either:\n"
+        "  Wide CSV: 'time' + one column per group\n"
+        "  Tidy CSV: time, group, (replicate), value\n"
+        "  Incucyte export TXT/TSV: metadata row + Date Time / Elapsed / well columns"
     )
 
 
 def aggregate_stats(df: pd.DataFrame, interval_hours: float = None) -> pd.DataFrame:
-    """
-    Aggregate replicates to group-level mean ± SD/SEM.
-    If interval_hours is not None, bin time into that spacing (e.g., 4 h).
-    """
     d = df.copy()
     if interval_hours is not None and interval_hours > 0:
         d["time_bin"] = (
@@ -131,10 +263,6 @@ def aggregate_stats(df: pd.DataFrame, interval_hours: float = None) -> pd.DataFr
 
 
 def make_color_list(n: int):
-    """
-    Return at least n colors.
-    Uses matplotlib categorical palettes and expands beyond 10 groups safely.
-    """
     cmap_names = ["tab20", "tab20b", "tab20c"]
     colors = []
 
@@ -157,7 +285,6 @@ def make_color_list(n: int):
 
 
 def save_figure_bytes(fig, fmt="png", dpi=300):
-    """Save matplotlib figure to bytes for download."""
     buf = io.BytesIO()
     save_kwargs = {"format": fmt, "bbox_inches": "tight"}
 
@@ -189,46 +316,39 @@ st.title("Incucyte Timecourse Plotter")
 
 st.markdown(
     """
-You can either **upload a CSV** *or* **enter the data manually**.
+You can either **upload a CSV / TXT / TSV** *or* **enter the data manually**.
 
-**Manual/tidy format columns:**
+Supported formats:
 
-- `time` – time in hours (0, 2, 4, 6, …)  
-- `group` – condition / treatment name (e.g. Control, DrugA)  
-- `replicate` – replicate ID (e.g. R1, R2, R3)  
-- `value` – confluence / intensity / whatever you measured
+- **Tidy**: `time, group, replicate, value`
+- **Wide**: `time` + one column per group or replicate
+- **Incucyte export TXT/TSV**: metadata row + `Date Time`, `Elapsed`, and well columns
 """
 )
 
 input_mode = st.radio(
     "How do you want to provide data?",
-    ["Upload CSV", "Enter data manually"],
+    ["Upload file", "Enter data manually"],
     index=0,
 )
 
 tidy = None
 
-# --------- MODE 1: Upload CSV ---------
-if input_mode == "Upload CSV":
-    uploaded = st.file_uploader("Upload CSV", type=["csv"])
+if input_mode == "Upload file":
+    uploaded = st.file_uploader("Upload CSV / TXT / TSV", type=["csv", "txt", "tsv"])
 
     if uploaded is not None:
         try:
             tidy = read_incucyte_csv(uploaded)
+            st.success("File parsed successfully.")
         except Exception as e:
             st.error(f"Error reading file: {e}")
             st.stop()
     else:
-        st.info("Upload a CSV to begin.")
+        st.info("Upload a file to begin.")
 
-# --------- MODE 2: Manual entry ---------
 else:
     st.markdown("### Enter your data")
-    st.write(
-        "You can **type directly** or **paste from Excel**. "
-        "Add/remove rows as needed."
-    )
-
     starter = pd.DataFrame(
         {
             "time": [0.0, 0.0, 2.0, 2.0],
@@ -255,8 +375,6 @@ else:
     if tidy.empty:
         st.warning("Fill in at least some rows (time + value) to generate plots.")
 
-# ---------- If we have tidy data, proceed ----------
-
 if tidy is not None and not tidy.empty:
     st.subheader("Parsed data (tidy format)")
     st.dataframe(tidy.head())
@@ -264,7 +382,6 @@ if tidy is not None and not tidy.empty:
     groups = pd.unique(tidy["group"].astype(str)).tolist()
     default_colors = make_color_list(len(groups))
 
-    # ---------- Sidebar settings ----------
     st.sidebar.header("Plot settings")
 
     x_label = st.sidebar.text_input("X axis label", value="Time (h)")
@@ -289,7 +406,6 @@ if tidy is not None and not tidy.empty:
         min_value=1,
         value=1,
         step=1,
-        help="1 = use all points; 2 = every 2nd; 3 = every 3rd; etc.",
     )
 
     show_replicates_on_mean = st.sidebar.checkbox(
@@ -321,54 +437,7 @@ if tidy is not None and not tidy.empty:
         step=0.5,
     )
 
-    st.sidebar.markdown("### Figure size")
-    figure_preset = st.sidebar.selectbox(
-        "Export preset",
-        ["Custom", "Screen", "Presentation", "Publication single-column", "Publication double-column"],
-        index=3,
-    )
-
-    preset_dims = {
-        "Custom": (8.0, 5.0),
-        "Screen": (8.0, 5.0),
-        "Presentation": (10.0, 6.0),
-        "Publication single-column": (3.35, 2.6),
-        "Publication double-column": (6.9, 4.8),
-    }
-
-    default_w, default_h = preset_dims[figure_preset]
-
-    fig_width = st.sidebar.number_input(
-        "Figure width (inches)",
-        min_value=2.0,
-        max_value=20.0,
-        value=float(default_w),
-        step=0.1,
-    )
-    fig_height = st.sidebar.number_input(
-        "Figure height (inches)",
-        min_value=2.0,
-        max_value=20.0,
-        value=float(default_h),
-        step=0.1,
-    )
-
-    st.sidebar.markdown("### Publication export")
-    export_format = st.sidebar.selectbox(
-        "Download format",
-        ["PNG", "PDF", "SVG", "TIFF"],
-        index=0,
-    )
-    export_dpi = st.sidebar.selectbox(
-        "Raster DPI",
-        [150, 300, 600, 1200],
-        index=2,
-        help="Used for PNG/TIFF only. PDF/SVG are vector exports.",
-    )
-
     st.sidebar.markdown("### Groups")
-    st.sidebar.caption("Rename groups and set colours manually.")
-
     name_map = {}
     color_map = {}
     for i, g in enumerate(groups):
@@ -394,15 +463,10 @@ if tidy is not None and not tidy.empty:
         }
     )
 
-    # ---------- Compute stats ----------
     stats = aggregate_stats(tidy, interval_hours=interval_hours)
 
-    stats = stats.merge(
-        group_df, on="group", how="left", validate="many_to_one"
-    )
-    tidy_merged = tidy.merge(
-        group_df, on="group", how="left", validate="many_to_one"
-    )
+    stats = stats.merge(group_df, on="group", how="left", validate="many_to_one")
+    tidy_merged = tidy.merge(group_df, on="group", how="left", validate="many_to_one")
 
     error_col = None
     plot_title_suffix = ""
@@ -413,8 +477,7 @@ if tidy is not None and not tidy.empty:
         error_col = "sem"
         plot_title_suffix = " ± SEM"
 
-    # ---------- Plot: mean ± chosen error ----------
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    fig, ax = plt.subplots(figsize=(8, 5))
 
     if show_replicates_on_mean:
         for (g, r), sub in tidy_merged.groupby(["group", "replicate"], sort=False):
@@ -466,107 +529,9 @@ if tidy is not None and not tidy.empty:
     st.subheader(f"Mean{plot_title_suffix} per group")
     st.pyplot(fig)
 
-    fmt = export_format.lower()
-    if fmt == "tiff":
-        fmt = "tif"
-
-    mean_buf = save_figure_bytes(fig, fmt=fmt, dpi=export_dpi)
-    st.download_button(
-        f"Download mean plot ({export_format}, {'vector' if export_format in ['PDF', 'SVG'] else f'{export_dpi} dpi'})",
-        data=mean_buf,
-        file_name=f"incucyte_mean_{error_choice.lower()}.{fmt}",
-        mime=get_download_mime(fmt),
-    )
-
-    # Optional quick-access publication downloads
-    png300_buf = save_figure_bytes(fig, fmt="png", dpi=300)
-    png600_buf = save_figure_bytes(fig, fmt="png", dpi=600)
-    pdf_buf = save_figure_bytes(fig, fmt="pdf", dpi=export_dpi)
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.download_button(
-            "Quick download PNG 300 dpi",
-            data=png300_buf,
-            file_name=f"incucyte_mean_{error_choice.lower()}_300dpi.png",
-            mime="image/png",
-        )
-    with col2:
-        st.download_button(
-            "Quick download PNG 600 dpi",
-            data=png600_buf,
-            file_name=f"incucyte_mean_{error_choice.lower()}_600dpi.png",
-            mime="image/png",
-        )
-    with col3:
-        st.download_button(
-            "Quick download PDF (vector)",
-            data=pdf_buf,
-            file_name=f"incucyte_mean_{error_choice.lower()}.pdf",
-            mime="application/pdf",
-        )
-
-    # ---------- Plot: replicate spaghetti ----------
-    fig2, ax2 = plt.subplots(figsize=(fig_width, fig_height))
-
-    for (g, r), sub in tidy_merged.groupby(["group", "replicate"], sort=False):
-        sub = sub.sort_values("time")
-        name = sub["display_name"].iloc[0]
-        color = sub["color"].iloc[0] if pd.notna(sub["color"].iloc[0]) else None
-        ax2.plot(
-            sub["time"],
-            sub["value"],
-            color=color,
-            alpha=replicate_alpha,
-            linewidth=1.5,
-            label=name,
-        )
-
-    # deduplicate legend labels
-    handles, labels = ax2.get_legend_handles_labels()
-    seen = set()
-    new_handles, new_labels = [], []
-    for h, l in zip(handles, labels):
-        if l not in seen:
-            new_handles.append(h)
-            new_labels.append(l)
-            seen.add(l)
-
-    ax2.set_xlabel(x_label)
-    ax2.set_ylabel(y_label)
-    ax2.legend(
-        new_handles,
-        new_labels,
-        title="Group",
-        bbox_to_anchor=(1.05, 1),
-        loc="upper left",
-    )
-    ax2.grid(True, alpha=0.3)
-
-    st.subheader("Replicate spaghetti plot")
-    st.pyplot(fig2)
-
-    spag_buf = save_figure_bytes(fig2, fmt=fmt, dpi=export_dpi)
-    st.download_button(
-        f"Download spaghetti plot ({export_format}, {'vector' if export_format in ['PDF', 'SVG'] else f'{export_dpi} dpi'})",
-        data=spag_buf,
-        file_name=f"incucyte_spaghetti.{fmt}",
-        mime=get_download_mime(fmt),
-    )
-
-    # ---------- Summary table + CSV ----------
     st.subheader("Summary table")
     st.dataframe(
         stats[["group", "display_name", "time", "mean", "sd", "sem", "n"]]
         .sort_values(["group", "time"])
         .reset_index(drop=True)
-    )
-
-    csv_buffer = io.StringIO()
-    stats.to_csv(csv_buffer, index=False)
-    st.download_button(
-        "Download summary CSV",
-        data=csv_buffer.getvalue(),
-        file_name="incucyte_summary_mean_sd_sem.csv",
-        mime="text/csv",
     )
